@@ -30,6 +30,7 @@ from authentik.stages.user_login.middleware import (
     logout_extra,
 )
 from authentik.stages.user_login.models import GeoIPBinding, NetworkBinding, UserLoginStage
+from authentik.stages.user_login.stage import COOKIE_NAME_KNOWN_DEVICE
 
 
 class TestUserLoginStage(FlowTestCase):
@@ -286,6 +287,52 @@ class TestUserLoginStage(FlowTestCase):
         sleep(5)
         self.client.session.clear_expired()
         self.assertEqual(list(self.client.session.keys()), [])
+
+    def test_remember_device(self):
+        """Test that the known-device cookie is set without a "stay signed in" prompt"""
+        self.stage.remember_device = "days=30"
+        self.stage.save()
+        plan = FlowPlan(flow_pk=self.flow.pk.hex, bindings=[self.binding], markers=[StageMarker()])
+        plan.context[PLAN_CONTEXT_PENDING_USER] = self.user
+        session = self.client.session
+        session[SESSION_KEY_PLAN] = plan
+        session.save()
+
+        response = self.client.get(
+            reverse("authentik_api:flow-executor", kwargs={"flow_slug": self.flow.slug})
+        )
+
+        self.assertStageRedirects(response, reverse("authentik_core:root-redirect"))
+        self.assertIn(COOKIE_NAME_KNOWN_DEVICE, response.cookies)
+
+    def test_remember_device_with_remember_me(self):
+        """Test that the known-device cookie is set regardless of the user's
+        "stay signed in" choice"""
+        self.stage.remember_device = "days=30"
+        self.stage.remember_me_offset = "days=7"
+        self.stage.save()
+        for remember_me in [True, False]:
+            with self.subTest(remember_me=remember_me):
+                plan = FlowPlan(
+                    flow_pk=self.flow.pk.hex, bindings=[self.binding], markers=[StageMarker()]
+                )
+                plan.context[PLAN_CONTEXT_PENDING_USER] = self.user
+                session = self.client.session
+                session[SESSION_KEY_PLAN] = plan
+                session.save()
+
+                response = self.client.get(
+                    reverse("authentik_api:flow-executor", kwargs={"flow_slug": self.flow.slug})
+                )
+                self.assertStageResponse(response, component="ak-stage-user-login")
+
+                response = self.client.post(
+                    reverse("authentik_api:flow-executor", kwargs={"flow_slug": self.flow.slug}),
+                    data={"remember_me": remember_me},
+                )
+
+                self.assertStageRedirects(response, reverse("authentik_core:root-redirect"))
+                self.assertIn(COOKIE_NAME_KNOWN_DEVICE, response.cookies)
 
     @patch(
         "authentik.flows.views.executor.to_stage_response",
