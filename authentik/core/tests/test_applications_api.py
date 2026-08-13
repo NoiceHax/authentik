@@ -6,7 +6,7 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 
 from authentik.core.models import Application
-from authentik.core.tests.utils import create_test_admin_user, create_test_flow
+from authentik.core.tests.utils import create_test_admin_user, create_test_flow, create_test_user
 from authentik.lib.generators import generate_id
 from authentik.policies.dummy.models import DummyPolicy
 from authentik.policies.models import PolicyBinding
@@ -91,11 +91,11 @@ class TestApplicationsAPI(APITestCase):
                 "pagination": {
                     "next": 0,
                     "previous": 0,
-                    "count": 2,
+                    "count": 1,
                     "current": 1,
                     "total_pages": 1,
                     "start_index": 1,
-                    "end_index": 2,
+                    "end_index": 1,
                 },
                 "results": [
                     {
@@ -137,6 +137,43 @@ class TestApplicationsAPI(APITestCase):
                 ],
             },
         )
+
+    def test_list_pagination(self):
+        """Test that pagination only counts applications the user has access to"""
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("authentik_api:application-list"), {"page_size": 1})
+        self.assertEqual(response.status_code, 200)
+        body = loads(response.content.decode())
+        self.assertEqual([app["slug"] for app in body["results"]], [self.allowed.slug])
+        self.assertEqual(body["pagination"]["count"], 1)
+        self.assertEqual(body["pagination"]["total_pages"], 1)
+        self.assertEqual(body["pagination"]["next"], 0)
+
+    def test_list_for_user(self):
+        """Test that pagination for `for_user` only counts applications that user
+        has access to"""
+        other_user = create_test_user()
+        self.client.force_login(self.user)
+        response = self.client.get(
+            reverse("authentik_api:application-list"),
+            {"for_user": other_user.pk, "page_size": 1},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = loads(response.content.decode())
+        self.assertEqual([app["slug"] for app in body["results"]], [self.allowed.slug])
+        self.assertEqual(body["pagination"]["count"], 1)
+        self.assertEqual(body["pagination"]["total_pages"], 1)
+        self.assertEqual(body["pagination"]["next"], 0)
+
+    def test_list_for_user_invalid(self):
+        """Test list operation with an invalid `for_user`"""
+        self.client.force_login(self.user)
+        response = self.client.get(
+            reverse("authentik_api:application-list"), {"for_user": generate_id()}
+        )
+        self.assertEqual(response.status_code, 400)
+        response = self.client.get(reverse("authentik_api:application-list"), {"for_user": -1})
+        self.assertEqual(response.status_code, 400)
 
     def test_list_superuser_full_list(self):
         """Test list operation with superuser_full_list"""

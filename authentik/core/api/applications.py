@@ -1,11 +1,10 @@
 """Application API Views"""
 
-from collections.abc import Iterator
 from copy import copy
+from uuid import UUID
 
 from django.core.cache import cache
-from django.db.models import Case, QuerySet
-from django.db.models.expressions import When
+from django.db.models import QuerySet
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext as _
 from drf_spectacular.types import OpenApiTypes
@@ -37,15 +36,11 @@ from authentik.rbac.filters import ObjectFilter
 LOGGER = get_logger()
 
 
-def user_app_cache_key(
-    user_pk: str, page_number: int | None = None, only_with_launch_url: bool = False
-) -> str:
+def user_app_cache_key(user_pk: str, only_with_launch_url: bool = False) -> str:
     """Cache key where application list for user is saved"""
     key = f"{CACHE_PREFIX}app_access/{user_pk}"
     if only_with_launch_url:
         key += "/launch"
-    if page_number:
-        key += f"/{page_number}"
     return key
 
 
@@ -171,46 +166,47 @@ class ApplicationViewSet(
             queryset = backend().filter_queryset(self.request, queryset, self)
         return queryset
 
-    def _get_allowed_applications(
-        self, paginated_apps: Iterator[Application], user: User | None = None
-    ) -> list[Application]:
-        apps = list(paginated_apps)
-        if not apps:
-            return []
+    def _get_allowed_application_pks(
+        self, user: User | None = None, only_with_launch_url: bool = False
+    ) -> list[UUID]:
+        """Primary keys of every application the given user (defaulting to the user of the
+        current request) is allowed to access. Policies are checked for all applications
+        instead of a single page, as pagination has to be applied to the filtered result
+        for the returned page count to match the applications the user can actually see."""
+        cache_key = None
+        # Results for another user depend on the request they're evaluated with, so they
+        # are only cached for the user making the request
+        if not user:
+            cache_key = user_app_cache_key(self.request.user.pk, only_with_launch_url)
+            cached_pks = cache.get(cache_key)
+            if cached_pks is not None:
+                return cached_pks
+        # Applications hidden from the user's dashboard are never returned by this endpoint,
+        # so they don't need to be checked either
+        queryset = Application.objects.exclude(meta_hide=True)
+        if only_with_launch_url:
+            # Pre-filter at DB level to skip expensive per-app policy evaluation
+            # for apps that can never appear in the launcher (no meta_launch_url
+            # and no provider, so no possible launch URL).
+            queryset = queryset.exclude(meta_launch_url="", provider__isnull=True)
         request = self.request._request
         if user:
             request = copy(request)
             request.user = user
-        engine = ListPolicyEngine(
-            Application.objects.filter(pk__in=[app.pk for app in apps]), request.user, request
-        )
+        engine = ListPolicyEngine(queryset, request.user, request)
         engine.empty_result = AppAccessWithoutBindings.get()
         engine.build()
-        passing_pks = set(engine.result.values_list("pk", flat=True))
-        # Filter (rather than re-fetch from engine.result) to preserve the original
-        # pagination order and the prefetching already applied by get_queryset().
-        return [app for app in apps if app.pk in passing_pks]
-
-    def _expand_applications(self, applications: list[Application]) -> QuerySet[Application]:
-        """
-        Re-fetch with proper prefetching for serialization
-        Cached applications don't have prefetched relationships, causing N+1 queries
-        during serialization when get_provider() is called
-        """
-        if not applications:
-            return self.get_queryset().none()
-        pks = [app.pk for app in applications]
-        return (
-            self.get_queryset()
-            .filter(pk__in=pks)
-            .order_by(Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(pks)]))
-        )
+        allowed_pks = list(engine.result.values_list("pk", flat=True))
+        if cache_key:
+            LOGGER.debug("Caching allowed application list")
+            cache.set(cache_key, allowed_pks, timeout=86400)
+        return allowed_pks
 
     def _filter_applications_with_launch_url(
-        self, paginated_apps: QuerySet[Application]
+        self, apps: QuerySet[Application]
     ) -> list[Application]:
         applications = []
-        for app in paginated_apps:
+        for app in apps:
             if app.get_launch_url():
                 applications.append(app)
         return applications
@@ -282,8 +278,6 @@ class ApplicationViewSet(
     )
     def list(self, request: Request) -> Response:
         """Custom list method that checks Policy based access instead of guardian"""
-        should_cache = request.query_params.get("search", "") == ""
-
         superuser_full_list = (
             str(request.query_params.get("superuser_full_list", "false")).lower() == "true"
         )
@@ -294,59 +288,30 @@ class ApplicationViewSet(
             str(request.query_params.get("only_with_launch_url", "false")).lower()
         ) == "true"
 
-        queryset = self._filter_queryset_for_list(self.get_queryset())
-        queryset = queryset.exclude(meta_hide=True)
-        if only_with_launch_url:
-            # Pre-filter at DB level to skip expensive per-app policy evaluation
-            # for apps that can never appear in the launcher (no meta_launch_url
-            # and no provider, so no possible launch URL).
-            queryset = queryset.exclude(meta_launch_url="", provider__isnull=True)
-        paginator: Pagination = self.paginator
-        paginated_apps = paginator.paginate_queryset(queryset, request)
-
+        for_user: User | None = None
         if "for_user" in request.query_params:
             try:
-                for_user: int = int(request.query_params.get("for_user", 0))
-                for_user = (
-                    get_objects_for_user(request.user, "authentik_core.view_user_applications")
-                    .filter(pk=for_user)
-                    .first()
-                )
-                if not for_user:
-                    raise ValidationError({"for_user": "User not found"})
+                for_user_pk = int(request.query_params.get("for_user", 0))
             except ValueError as exc:
                 raise ValidationError from exc
-            allowed_applications = self._get_allowed_applications(paginated_apps, user=for_user)
-
-            serializer = self.get_serializer(allowed_applications, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        allowed_applications = []
-        if not should_cache:
-            allowed_applications = self._get_allowed_applications(paginated_apps)
-        if should_cache:
-            allowed_applications = cache.get(
-                user_app_cache_key(
-                    self.request.user.pk, paginator.page.number, only_with_launch_url
-                )
+            for_user = (
+                get_objects_for_user(request.user, "authentik_core.view_user_applications")
+                .filter(pk=for_user_pk)
+                .first()
             )
-            if allowed_applications:
-                # Re-fetch cached applications since pickled instances lose prefetched
-                # relationships, causing N+1 queries during serialization
-                allowed_applications = self._expand_applications(allowed_applications)
-            else:
-                LOGGER.debug("Caching allowed application list", page=paginator.page.number)
-                allowed_applications = self._get_allowed_applications(paginated_apps)
-                cache.set(
-                    user_app_cache_key(
-                        self.request.user.pk, paginator.page.number, only_with_launch_url
-                    ),
-                    allowed_applications,
-                    timeout=86400,
-                )
+            if not for_user:
+                raise ValidationError({"for_user": "User not found"})
 
+        queryset = self._filter_queryset_for_list(self.get_queryset())
+        queryset = queryset.filter(
+            pk__in=self._get_allowed_application_pks(for_user, only_with_launch_url)
+        )
+
+        allowed_applications = queryset
         if only_with_launch_url:
-            allowed_applications = self._filter_applications_with_launch_url(allowed_applications)
+            allowed_applications = self._filter_applications_with_launch_url(queryset)
 
-        serializer = self.get_serializer(allowed_applications, many=True)
+        paginator: Pagination = self.paginator
+        paginated_apps = paginator.paginate_queryset(allowed_applications, request)
+        serializer = self.get_serializer(paginated_apps, many=True)
         return self.get_paginated_response(serializer.data)
